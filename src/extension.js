@@ -16,6 +16,7 @@
 
 import { Extension, gettext as _ } from "resource:///org/gnome/shell/extensions/extension.js";
 import Meta from 'gi://Meta';
+import Clutter from 'gi://Clutter';
 
 // GNOME 49 renamed get_maximized() to get_maximize_flags()
 const _getMaximizeFlags = Meta.Window.prototype.get_maximize_flags
@@ -50,23 +51,55 @@ export default class UselessGapsExtension extends Extension {
     };
   }
 
-  addWindowMargins(window){
-    const rects = this.getRectangles(window);
+  getGappedRect(window) {
+    const monitor = window.get_monitor();
+    const workspace = window.get_workspace();
+    const monitorWorkArea = workspace.get_work_area_for_monitor(monitor);
 
-    const newWidth = rects.window.w - (this.gapSize*2) - this.marginLeft - this.marginRight;
-    const newHeight = rects.window.h - (this.gapSize*2) - this.marginTop - this.marginBottom;
+    const newWidth = monitorWorkArea.width - (this.gapSize*2) - this.marginLeft - this.marginRight;
+    const newHeight = monitorWorkArea.height - (this.gapSize*2) - this.marginTop - this.marginBottom;
+    const xStart = this.marginLeft + monitorWorkArea.x + this.gapSize;
+    const yStart = this.marginTop + monitorWorkArea.y + this.gapSize;
 
-    const xStart = this.marginLeft + rects.workspace.x + this.gapSize;
-    const yStart = this.marginTop + rects.workspace.y + this.gapSize;
+    return { x: xStart, y: yStart, w: newWidth, h: newHeight };
+  }
 
+  addWindowMargins(window, animateFrom){
+    if (_getMaximizeFlags(window) !== Meta.MaximizeFlags.BOTH)
+      return;
 
-    if (_getMaximizeFlags(window) === Meta.MaximizeFlags.BOTH){
-      window.unmaximize(Meta.MaximizeFlags.BOTH);
-      window.move_resize_frame(false, xStart, yStart, newWidth, newHeight);
-      // Mark as gapped (original geometry was saved in size_change handler);
-      // if called from unminimize without size_change, just mark as gapped
-      if (!(window.get_id() in _gapped_windows)) {
-        _gapped_windows[window.get_id()] = true;
+    const gapped = this.getGappedRect(window);
+
+    window.unmaximize(Meta.MaximizeFlags.BOTH);
+    window.move_resize_frame(false, gapped.x, gapped.y, gapped.w, gapped.h);
+
+    // Mark as gapped
+    if (!(window.get_id() in _gapped_windows)) {
+      _gapped_windows[window.get_id()] = true;
+    }
+
+    // Animate from the original rect to the gapped rect
+    if (animateFrom) {
+      const actor = window.get_compositor_private();
+      if (actor) {
+        actor.remove_all_transitions();
+        actor.set_opacity(255);
+
+        // Use translation + scale to animate from original position
+        actor.set_pivot_point(0, 0);
+        actor.translation_x = animateFrom.x - gapped.x;
+        actor.translation_y = animateFrom.y - gapped.y;
+        actor.scale_x = animateFrom.w / gapped.w;
+        actor.scale_y = animateFrom.h / gapped.h;
+
+        actor.ease({
+          translation_x: 0,
+          translation_y: 0,
+          scale_x: 1.0,
+          scale_y: 1.0,
+          duration: 200,
+          mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+        });
       }
     }
   }
@@ -111,14 +144,20 @@ export default class UselessGapsExtension extends Extension {
       {
         if (win.get_id() in _gapped_windows) {
           // Window is already gapped — user wants to un-maximize (e.g. double-click title bar).
-          // Save the pre-gap rect so we can restore it, then mark for ungapping.
           _windowids_size_change[win.get_id()] = "ungap";
-        } else {
+        } else if (!this.noGapsForMaximizedWindows) {
           // Save original geometry before we apply gaps
           _gapped_windows[win.get_id()] = {
             x: rectold.x, y: rectold.y, w: rectold.width, h: rectold.height
           };
           _windowids_size_change[win.get_id()] = "gapmax";
+
+          // Hide the actor during the maximize animation to prevent flash
+          const actor = win.get_compositor_private();
+          if (actor) {
+            actor.remove_all_transitions();
+            actor.set_opacity(0);
+          }
         }
       }
       else if(_getMaximizeFlags(win) === Meta.MaximizeFlags.VERTICAL){
@@ -143,8 +182,10 @@ export default class UselessGapsExtension extends Extension {
           win.move_resize_frame(false, orig.x, orig.y, orig.w, orig.h);
         }
       }
-      else if (!this.noGapsForMaximizedWindows && action === "gapmax") {
-        this.addWindowMargins(win);
+      else if (action === "gapmax") {
+        const orig = _gapped_windows[win.get_id()];
+        const animateFrom = (orig && typeof orig === 'object') ? orig : null;
+        this.addWindowMargins(win, animateFrom);
       }
       else if (action === "gapvert") {
         this.addSplitWindowMargins(win);
