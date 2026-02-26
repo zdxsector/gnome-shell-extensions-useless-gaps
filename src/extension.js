@@ -17,8 +17,14 @@
 import { Extension, gettext as _ } from "resource:///org/gnome/shell/extensions/extension.js";
 import Meta from 'gi://Meta';
 
+// GNOME 49 renamed get_maximized() to get_maximize_flags()
+const _getMaximizeFlags = Meta.Window.prototype.get_maximize_flags
+    ? (win) => win.get_maximize_flags()
+    : (win) => win.get_maximized();
+
 const _handles = [];
 const _windowids_size_change = {};
+const _gapped_windows = {};       // window-id → original rect {x, y, w, h}
 
 export default class UselessGapsExtension extends Extension {
 
@@ -54,9 +60,14 @@ export default class UselessGapsExtension extends Extension {
     const yStart = this.marginTop + rects.workspace.y + this.gapSize;
 
 
-    if (window.get_maximized() === Meta.MaximizeFlags.BOTH){
+    if (_getMaximizeFlags(window) === Meta.MaximizeFlags.BOTH){
       window.unmaximize(Meta.MaximizeFlags.BOTH);
       window.move_resize_frame(false, xStart, yStart, newWidth, newHeight);
+      // Mark as gapped (original geometry was saved in size_change handler);
+      // if called from unminimize without size_change, just mark as gapped
+      if (!(window.get_id() in _gapped_windows)) {
+        _gapped_windows[window.get_id()] = true;
+      }
     }
   }
 
@@ -81,6 +92,9 @@ export default class UselessGapsExtension extends Extension {
 
     window.unmaximize(Meta.MaximizeFlags.BOTH);
     window.move_resize_frame(false, xStart, yStart, newWidth, newHeight);
+    // Split windows are not tracked for toggle since vertical maximize
+    // has its own toggle behavior in GNOME
+    delete _gapped_windows[window.get_id()];
   }
 
 
@@ -93,14 +107,22 @@ export default class UselessGapsExtension extends Extension {
 
     if (change === Meta.SizeChange.MAXIMIZE)
     {
-      if (win.get_maximized() === Meta.MaximizeFlags.BOTH)
+      if (_getMaximizeFlags(win) === Meta.MaximizeFlags.BOTH)
       {
-        //  global.log("uselessgaps change","=== Meta.MaximizeFlags.BOTH");
-        _windowids_size_change[win.get_id()]="gapmax";
+        if (win.get_id() in _gapped_windows) {
+          // Window is already gapped — user wants to un-maximize (e.g. double-click title bar).
+          // Save the pre-gap rect so we can restore it, then mark for ungapping.
+          _windowids_size_change[win.get_id()] = "ungap";
+        } else {
+          // Save original geometry before we apply gaps
+          _gapped_windows[win.get_id()] = {
+            x: rectold.x, y: rectold.y, w: rectold.width, h: rectold.height
+          };
+          _windowids_size_change[win.get_id()] = "gapmax";
+        }
       }
-      else if(win.get_maximized() === Meta.MaximizeFlags.VERTICAL){
+      else if(_getMaximizeFlags(win) === Meta.MaximizeFlags.VERTICAL){
         _windowids_size_change[win.get_id()]="gapvert";
-
       }
     }
   }
@@ -109,12 +131,22 @@ export default class UselessGapsExtension extends Extension {
     const win = act.meta_window;
 
     if (win.get_id() in _windowids_size_change) {
-      if (!this.noGapsForMaximizedWindows && _windowids_size_change[win.get_id()]=="gapmax") {
-        delete _windowids_size_change[win.get_id()];
+      const action = _windowids_size_change[win.get_id()];
+      delete _windowids_size_change[win.get_id()];
+
+      if (action === "ungap") {
+        // Restore original pre-gap geometry
+        const orig = _gapped_windows[win.get_id()];
+        delete _gapped_windows[win.get_id()];
+        win.unmaximize(Meta.MaximizeFlags.BOTH);
+        if (orig && typeof orig === 'object') {
+          win.move_resize_frame(false, orig.x, orig.y, orig.w, orig.h);
+        }
+      }
+      else if (!this.noGapsForMaximizedWindows && action === "gapmax") {
         this.addWindowMargins(win);
       }
-      else if (_windowids_size_change[win.get_id()]=="gapvert") {
-        delete _windowids_size_change[win.get_id()];
+      else if (action === "gapvert") {
         this.addSplitWindowMargins(win);
       }
     }
@@ -141,11 +173,26 @@ export default class UselessGapsExtension extends Extension {
 
     _handles.push(global.window_manager.connect('size-changed', (_, act) => {this.window_manager_size_changed(act);}));
     _handles.push(global.window_manager.connect('size-change', (_, act, change,rectold) => {this.window_manager_size_change(act,change,rectold);}));
+
+    // Re-apply gaps when a window is restored from minimize, since the WM
+    // may re-maximize it without firing the size-change signal
+    _handles.push(global.window_manager.connect('unminimize', (_, act) => {
+      const win = act.meta_window;
+      if (win.window_type !== Meta.WindowType.NORMAL) return;
+      if (!this.noGapsForMaximizedWindows && _getMaximizeFlags(win) === Meta.MaximizeFlags.BOTH) {
+        this.addWindowMargins(win);
+      }
+      else if (_getMaximizeFlags(win) === Meta.MaximizeFlags.VERTICAL) {
+        this.addSplitWindowMargins(win);
+      }
+    }));
   }
 
   disable() {
     this._settings = null;
     _handles.splice(0).forEach(h => global.window_manager.disconnect(h));
+    for (const id in _gapped_windows) delete _gapped_windows[id];
+    for (const id in _windowids_size_change) delete _windowids_size_change[id];
   }
 }
 
